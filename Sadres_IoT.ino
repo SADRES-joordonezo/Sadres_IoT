@@ -1,14 +1,13 @@
-#include <ArduinoWebsockets.h>
-#include "esp_http_server.h"
+
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "camera_index.h"
 #include <Preferences.h>
 #include "BluetoothSerial.h"
-
-
-#define CAMERA_MODEL_ESP_EYE
-//#define CAMERA_MODEL_AI_THINKER
+#include "soc/soc.h"           // Disable brownour problems
+#include "soc/rtc_cntl_reg.h"  // Disable brownour problems
+#include "Arduino.h"
+#define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 
 String ssids_array[50];
@@ -17,10 +16,11 @@ String connected_string;
 
 const char* pref_ssid = "";
 const char* pref_pass = "";
+
 String client_wifi_ssid;
 String client_wifi_password;
 
-const char* bluetooth_name = "robot01";
+const char* bluetooth_name = "SADRESIoT";
 
 long start_wifi_millis;
 long wifi_timeout = 10000;
@@ -31,18 +31,80 @@ enum wifi_setup_stages wifi_stage = NONE;
 
 camera_fb_t * fb = NULL;
 
-using namespace websockets;
-WebsocketsServer socket_server;
 BluetoothSerial SerialBT;
 Preferences preferences;
 
-httpd_handle_t camera_httpd = NULL;
 
+bool inRequest = false;
+String serverName = "23.101.176.213";
+String serverPath = "/SadresService/api/searchImg";
+const int serverPort = 80;
+
+WiFiClient client;
+
+const int timerInterval = 30000;    // time between each HTTP POST image
+unsigned long previousMillis = 0;   // last time image was sent
+#define PIR_PIN 14
+
+bool init_wifi()
+{
+  String temp_pref_ssid = preferences.getString("pref_ssid");
+  String temp_pref_pass = preferences.getString("pref_pass");
+  pref_ssid = temp_pref_ssid.c_str();
+  pref_pass = temp_pref_pass.c_str();
+
+  Serial.println(pref_ssid);
+  Serial.println(pref_pass);
+
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+
+  start_wifi_millis = millis();
+  WiFi.begin(pref_ssid, pref_pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start_wifi_millis > wifi_timeout) {
+      WiFi.disconnect(true, true);
+      return false;
+    }
+  }
+  return true;
+}
+void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+  
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    wifi_stage = SCAN_START;
+  }
+
+  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == SCAN_COMPLETE) { // data from phone is SSID
+    int client_wifi_ssid_id = SerialBT.readString().toInt();
+    client_wifi_ssid = ssids_array[client_wifi_ssid_id];
+    wifi_stage = SSID_ENTERED;
+  }
+
+  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == WAIT_PASS) { // data from phone is password
+    client_wifi_password = SerialBT.readString();
+    client_wifi_password.trim();
+    wifi_stage = PASS_ENTERED;
+  }
+
+}
+void callback_show_ip(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    SerialBT.print("ESP32 IP: ");
+    SerialBT.println(WiFi.localIP());
+    bluetooth_disconnect = true;
+  }
+}
 void setup()
 {
   Serial.begin(115200);
   Serial.println("Booting...");
-
+  pinMode(PIR_PIN, INPUT);
+  pinMode(4, OUTPUT);
+  
   preferences.begin("wifi_access", false);
 
   camera_config_t config;
@@ -77,16 +139,12 @@ void setup()
     config.fb_count = 1;
   }
 
-#if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-#endif
 
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    ESP.restart();
   }
 
   sensor_t * s = esp_camera_sensor_get();
@@ -99,35 +157,10 @@ void setup()
   }
 
   SerialBT.begin(bluetooth_name);
+  Serial.println("serial begin");
+ }
 
-  app_httpserver_init();
-  socket_server.listen(82);
-}
 
-bool init_wifi()
-{
-  String temp_pref_ssid = preferences.getString("pref_ssid");
-  String temp_pref_pass = preferences.getString("pref_pass");
-  pref_ssid = temp_pref_ssid.c_str();
-  pref_pass = temp_pref_pass.c_str();
-
-  Serial.println(pref_ssid);
-  Serial.println(pref_pass);
-
-  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
-
-  start_wifi_millis = millis();
-  WiFi.begin(pref_ssid, pref_pass);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    if (millis() - start_wifi_millis > wifi_timeout) {
-      WiFi.disconnect(true, true);
-      return false;
-    }
-  }
-  return true;
-}
 
 void scan_wifi_networks()
 {
@@ -154,58 +187,11 @@ void scan_wifi_networks()
   }
 }
 
-void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
-{
-  
-  if (event == ESP_SPP_SRV_OPEN_EVT) {
-    wifi_stage = SCAN_START;
-  }
 
-  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == SCAN_COMPLETE) { // data from phone is SSID
-    int client_wifi_ssid_id = SerialBT.readString().toInt();
-    client_wifi_ssid = ssids_array[client_wifi_ssid_id];
-    wifi_stage = SSID_ENTERED;
-  }
 
-  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == WAIT_PASS) { // data from phone is password
-    client_wifi_password = SerialBT.readString();
-    client_wifi_password.trim();
-    wifi_stage = PASS_ENTERED;
-  }
 
-}
 
-void callback_show_ip(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
-{
-  if (event == ESP_SPP_SRV_OPEN_EVT) {
-    SerialBT.print("ESP32 IP: ");
-    SerialBT.println(WiFi.localIP());
-    bluetooth_disconnect = true;
-  }
-}
 
-static esp_err_t main_handler(httpd_req_t *req) {
-  httpd_resp_set_type(req, "text/html");
-  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-  return httpd_resp_send(req, (const char *)main_html, main_html_len);
-}
-
-httpd_uri_t main_uri = {
-  .uri       = "/",
-  .method    = HTTP_GET,
-  .handler   = main_handler,
-  .user_ctx  = NULL
-};
-
-void app_httpserver_init ()
-{
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  if (httpd_start(&camera_httpd, &config) == ESP_OK)
-  {
-    Serial.println("httpd_start");
-    httpd_register_uri_handler(camera_httpd, &main_uri);
-  }
-}
 
 void disconnect_bluetooth()
 {
@@ -220,7 +206,88 @@ void disconnect_bluetooth()
   delay(1000);
   bluetooth_disconnect = false;
 }
+String takePhoto(){
+  inRequest = true;
+  String getAll;
+  String getBody;
+  
+  camera_fb_t * fb = NULL;
+  
+  // Take Picture with Camera
+  digitalWrite(4, HIGH);
+  fb = esp_camera_fb_get();
+  if(!fb) {
+    Serial.println("Camera capture failed");
+    delay(1000);
+    ESP.restart();
+  }
+  delay(500); 
+  digitalWrite(4, LOW);
+  
+  if (client.connect(serverName.c_str(), serverPort)) {
+    Serial.println("Connection successful!");    
+    String head = "--SADRES\r\nContent-Disposition: form-data; name=\"file\"; filename=\"esp32-cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--SADRES--\r\n";
 
+    uint32_t imageLen = fb->len;
+    uint32_t extraLen = head.length() + tail.length();
+    uint32_t totalLen = imageLen + extraLen;
+  
+    client.println("POST " + serverPath + " HTTP/1.1");
+    client.println("Host: " + serverName);
+    client.println("Content-Length: " + String(totalLen));
+    client.println("Content-Type: multipart/form-data; boundary=SADRES");
+    client.println();
+    client.print(head);
+  
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+    for (size_t n=0; n<fbLen; n=n+1024) {
+      if (n+1024 < fbLen) {
+        client.write(fbBuf, 1024);
+        fbBuf += 1024;
+      }
+      else if (fbLen%1024>0) {
+        size_t remainder = fbLen%1024;
+        client.write(fbBuf, remainder);
+      }
+    }   
+    client.print(tail);
+    
+    esp_camera_fb_return(fb);
+    
+    int timoutTimer = 10000;
+    long startTimer = millis();
+    boolean state = false;
+    
+    while ((startTimer + timoutTimer) > millis()) {
+      Serial.print(".");
+      delay(100);      
+      while (client.available()) {
+        char c = client.read();
+        if (c == '\n') {
+          if (getAll.length()==0) { state=true; }
+          getAll = "";
+        }
+        else if (c != '\r') { getAll += String(c); }
+        if (state==true) { getBody += String(c); }
+        startTimer = millis();
+      }
+      if (getBody.length()>0) { break; }
+    }
+    Serial.println();
+    client.stop();
+    Serial.println(getBody);
+  }
+  else {
+    getBody = "Connection to " + serverName +  " failed.";
+    Serial.println(getBody);
+  }
+  inRequest = false;
+  esp_camera_fb_return(fb); 
+  delay(2000);
+  return getBody;
+}
 void loop()
 {
   
@@ -270,15 +337,11 @@ void loop()
       break;
   }
 
-  if (socket_server.poll()) {
-    disconnect_bluetooth();
-    auto client = socket_server.accept();
-    while (client.available()) {
-      fb = esp_camera_fb_get();
-      client.sendBinary((const char *)fb->buf, fb->len);
-      esp_camera_fb_return(fb);
-      fb = NULL;
-    }
+   if(!inRequest && digitalRead(PIR_PIN) == HIGH){
+      Serial.println("tomando foto");
+      takePhoto();
+  }else if(digitalRead(PIR_PIN) == LOW){
+    Serial.print(".");
   }
-  
 }
+
